@@ -1,0 +1,4 @@
+# 公开仓库只保留二进制与 workflow，不含任何源码/密钥/缓存
+usps_token_cache.json
+proxies.txt
+*.log

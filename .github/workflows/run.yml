@@ -1,0 +1,43 @@
+name: USPS Tracker
+
+# 触发方式：
+#  - workflow_dispatch：手动触发，也是“链式接力”自触发用的入口
+#  - schedule：兜底定时，万一接力断了，每小时能自动重新接上
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 * * * *"
+
+# 不设并发互斥：允许上一轮在收尾时下一轮已经启动，保证“无缝接力、几乎不间断”
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # 在仓库 Settings -> Secrets and variables -> Actions 配置以下 Secrets
+      USPS_CLIENT_ID: ${{ secrets.USPS_CLIENT_ID }}
+      USPS_CLIENT_SECRET: ${{ secrets.USPS_CLIENT_SECRET }}
+      NUM_TYPE: big
+      WORKERS: "1"
+      USE_PROXY: "false"
+      RUST_LOG: info
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 关键：在运行业务前，先排队好“下一轮”。
+      # 用 PAT（个人访问令牌）触发，避免内置 GITHUB_TOKEN 不能自触发的限制。
+      # 即使本轮 3-5 分钟后正常退出，下一轮也已经被触发，拿到全新机器和 IP，实现持续接力。
+      - name: 触发下一轮（链式接力）
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          gh workflow run "USPS Tracker" --ref "${{ github.ref_name }}"
+
+      - name: 运行预编译二进制
+        # 二进制为 x86_64-unknown-linux-musl 静态链接，无外部依赖
+        # 程序内部随机运行 3-5 分钟后自动优雅退出
+        run: |
+          chmod +x ./bin/usps-tracker-rs
+          ./bin/usps-tracker-rs
