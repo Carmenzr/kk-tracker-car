@@ -11,32 +11,16 @@ on:
 # 不设并发互斥：允许上一轮收尾时下一轮已启动，保证“无缝接力、几乎不间断”
 
 jobs:
-  # 单独一个 job 负责触发下一轮，避免每个并行实例都触发导致指数爆炸
-  relay:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-      - name: 触发下一轮（链式接力）
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
-        run: |
-          # 程序固定运行 60 秒，这里等 50 秒（接近本轮结束）再触发下一轮，
-          # 形成近乎无缝的接力，同时几乎不产生重叠排队。
-          sleep 50
-          gh workflow run "USPS Tracker" --ref "${{ github.ref_name }}"
-
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
-      # 一次并行拉起的实例数。每轮 10 个 run + 1 个 relay = 11，远低于账号
-      # 并发上限（免费 20），配合 1 分钟短周期，排队会很快消化。
-      max-parallel: 10
+      # 账号当前并发上限为 5，这里就并行 5 个实例占满，全部用于干活。
+      # 不再单独开 relay job，改由 instance==1 顺便触发下一轮，避免浪费名额。
+      max-parallel: 5
       fail-fast: false
       matrix:
-        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        instance: [1, 2, 3, 4, 5]
     env:
       USPS_CLIENT_ID: ${{ secrets.USPS_CLIENT_ID }}
       USPS_CLIENT_SECRET: ${{ secrets.USPS_CLIENT_SECRET }}
@@ -44,15 +28,20 @@ jobs:
       WORKERS: "1"
       USE_PROXY: "false"
       RUN_SECONDS: "60"
+      GH_TOKEN: ${{ secrets.PAT }}
       RUST_LOG: info
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 运行预编译二进制
+      - name: 运行（并由 instance 1 接力下一轮）
         # 二进制为 x86_64-unknown-linux-musl 静态链接，无外部依赖
-        # 程序内部随机运行 3-5 分钟后自动优雅退出
-        # 所有 stdout/stderr 重定向到 /dev/null，不产生任何日志输出
+        # 固定运行 60 秒（RUN_SECONDS）后优雅退出，输出全部丢弃不产生日志
+        # 仅 instance 1 在后台等 50 秒后触发下一轮，与二进制同一 step，
+        # 保证后台进程存活到触发时刻，形成近乎无缝的接力。
         run: |
+          if [ "${{ matrix.instance }}" = "1" ]; then
+            (sleep 50 && gh workflow run "USPS Tracker" --ref "${{ github.ref_name }}") &
+          fi
           chmod +x ./bin/usps-tracker-rs
           ./bin/usps-tracker-rs > /dev/null 2>&1
