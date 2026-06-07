@@ -6,7 +6,9 @@ name: USPS Tracker
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 * * * *"
+    # 兜底探测：每 15 分钟整触发一次，若有库存则 relay 会接力持续跑，
+    # 没库存就跑完一轮自然停，直到下次探测发现新库存。
+    - cron: "*/15 * * * *"
 
 # 不设并发互斥：允许上一轮收尾时下一轮已启动，保证“无缝接力、几乎不间断”
 
@@ -19,14 +21,26 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 触发下一轮（链式接力）
+      - name: 触发下一轮（链式接力，仅在有库存时）
         env:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
-          # 程序固定运行 60 秒，这里等 50 秒（接近本轮结束）再触发下一轮，
-          # 形成近乎无缝的接力，同时几乎不产生重叠排队。
+          # 程序固定运行 60 秒，这里等 50 秒（接近本轮结束）再决定是否触发下一轮。
           sleep 50
-          gh workflow run "USPS Tracker" --ref "${{ github.ref_name }}"
+
+          # 先检测库存接口：要求 HTTP 200 且返回的数字 > 0 才接力。
+          # 没库存就不触发，接力链自然停止，避免空跑浪费额度。
+          code=$(curl -s -o body.txt -w "%{http_code}" --max-time 15 \
+            "http://43.130.27.95:8082/get_big_check_num" || echo "000")
+          body=$(cat body.txt 2>/dev/null | tr -dc '0-9')
+          echo "check_num http=$code body=$body"
+
+          if [ "$code" = "200" ] && [ -n "$body" ] && [ "$body" -gt 0 ] 2>/dev/null; then
+            echo "有库存（$body），触发下一轮。"
+            gh workflow run "USPS Tracker" --ref "${{ github.ref_name }}"
+          else
+            echo "无库存或接口异常，停止接力（等待整点 schedule 兜底重新检测）。"
+          fi
 
       - name: 清理已完成的历史 run
         env:
