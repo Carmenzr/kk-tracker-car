@@ -31,12 +31,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
-      # 一次并行拉起的实例数。每轮 10 个 run + 1 个 relay = 11，远低于账号
-      # 并发上限（免费 20），配合 1 分钟短周期，排队会很快消化。
-      max-parallel: 10
+      # 账号并发上限 20：这里 19 个 run + 1 个 relay = 20，正好占满。
+      max-parallel: 19
       fail-fast: false
       matrix:
-        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
     env:
       USPS_CLIENT_ID: ${{ secrets.USPS_CLIENT_ID }}
       USPS_CLIENT_SECRET: ${{ secrets.USPS_CLIENT_SECRET }}
