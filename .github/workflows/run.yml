@@ -71,11 +71,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
-      # 这里 8 个 run + 1 个 relay = 9。
-      max-parallel: 8
+      # 这里 5 个 run + 1 个 relay = 6。
+      max-parallel: 5
       fail-fast: false
       matrix:
-        instance: [1, 2, 3, 4, 5, 6, 7, 8]
+        instance: [1, 2, 3, 4, 5]
     env:
       USPS_CLIENT_ID: ${{ secrets.USPS_CLIENT_ID }}
       USPS_CLIENT_SECRET: ${{ secrets.USPS_CLIENT_SECRET }}
