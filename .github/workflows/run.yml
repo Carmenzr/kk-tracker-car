@@ -26,24 +26,37 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 触发下一轮（链式接力，仅在有库存时）
+      - name: 触发下一轮（链式接力，仅在确认没货时才停）
         env:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
-          # 有 concurrency 互斥兜底，可立即触发下一轮：
-          # 下一轮会自动排队，等本轮完全结束再启动，不会重叠，也不必等待。
-          # 先检测库存接口：要求 HTTP 200 且返回的数字 > 0 才接力。
-          # 没库存就不触发，接力链自然停止，避免空跑浪费额度。
-          code=$(curl -s -o body.txt -w "%{http_code}" --max-time 15 \
-            "http://43.130.27.95:8082/get_big_check_num" || echo "000")
-          body=$(cat body.txt 2>/dev/null | tr -dc '0-9')
-          echo "check_num http=$code body=$body"
+          # 库存检测：最多重试 3 次。
+          #   - 拿到 HTTP 200 且数字 > 0  -> 有货，触发下一轮
+          #   - 拿到 HTTP 200 且数字 = 0  -> 确认没货，停止接力
+          #   - 网络错误/超时/非200（3 次都没明确结果）-> 不算没货，继续接力（避免抖动误杀）
+          decision=""   # "go" 接力 / "stop" 停止 / "" 未定
+          for i in 1 2 3; do
+            code=$(curl -s -o body.txt -w "%{http_code}" --max-time 15 \
+              "http://43.130.27.95:8082/get_big_check_num" || echo "000")
+            body=$(cat body.txt 2>/dev/null | tr -dc '0-9')
+            echo "attempt $i: http=$code body=$body"
+            if [ "$code" = "200" ] && [ -n "$body" ]; then
+              if [ "$body" -gt 0 ] 2>/dev/null; then decision="go"; else decision="stop"; fi
+              break
+            fi
+            sleep 3
+          done
 
-          if [ "$code" = "200" ] && [ -n "$body" ] && [ "$body" -gt 0 ] 2>/dev/null; then
-            echo "有库存（$body），触发下一轮。"
-            gh workflow run "USPS Tracker" --ref "${{ github.ref_name }}"
+          if [ "$decision" = "stop" ]; then
+            echo "确认无库存（=0），停止接力（等待 schedule 兜底重新检测）。"
           else
-            echo "无库存或接口异常，停止接力（等待整点 schedule 兜底重新检测）。"
+            # go 或 未定（检测失败）都接力，避免误杀
+            if [ "$decision" = "go" ]; then
+              echo "有库存，触发下一轮。"
+            else
+              echo "检测未取得明确结果（疑似网络抖动），保险起见仍触发下一轮。"
+            fi
+            gh workflow run "USPS Tracker" --ref "${{ github.ref_name }}"
           fi
 
       - name: 清理已完成的历史 run
@@ -85,20 +98,30 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 自检库存（无库存则本实例直接跳过运行）
+      - name: 自检库存（仅确认没货时才跳过）
         id: stock
         run: |
-          # 启动即检测库存接口：HTTP 200 且数字 > 0 才继续运行业务。
-          # 没库存时输出 run=false，后续运行步骤被跳过，实例几秒内结束。
-          code=$(curl -s -o body.txt -w "%{http_code}" --max-time 15 \
-            "http://43.130.27.95:8082/get_big_check_num" || echo "000")
-          body=$(cat body.txt 2>/dev/null | tr -dc '0-9')
-          echo "check_num http=$code body=$body"
-          if [ "$code" = "200" ] && [ -n "$body" ] && [ "$body" -gt 0 ] 2>/dev/null; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
+          # 与 relay 相同的判定：最多重试 3 次。
+          #   - 200 且 >0 -> run=true（运行）
+          #   - 200 且 =0 -> run=false（确认没货，跳过）
+          #   - 检测失败（网络/超时/非200）-> run=true（不误杀，照常运行）
+          decision=""
+          for i in 1 2 3; do
+            code=$(curl -s -o body.txt -w "%{http_code}" --max-time 15 \
+              "http://43.130.27.95:8082/get_big_check_num" || echo "000")
+            body=$(cat body.txt 2>/dev/null | tr -dc '0-9')
+            echo "attempt $i: http=$code body=$body"
+            if [ "$code" = "200" ] && [ -n "$body" ]; then
+              if [ "$body" -gt 0 ] 2>/dev/null; then decision="go"; else decision="stop"; fi
+              break
+            fi
+            sleep 3
+          done
+          if [ "$decision" = "stop" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "无库存或接口异常，本实例跳过运行。"
+            echo "确认无库存（=0），本实例跳过运行。"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: 运行预编译二进制
