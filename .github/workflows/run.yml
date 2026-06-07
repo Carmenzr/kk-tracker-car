@@ -81,7 +81,24 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
+      - name: 自检库存（无库存则本实例直接跳过运行）
+        id: stock
+        run: |
+          # 启动即检测库存接口：HTTP 200 且数字 > 0 才继续运行业务。
+          # 没库存时输出 run=false，后续运行步骤被跳过，实例几秒内结束。
+          code=$(curl -s -o body.txt -w "%{http_code}" --max-time 15 \
+            "http://43.130.27.95:8082/get_big_check_num" || echo "000")
+          body=$(cat body.txt 2>/dev/null | tr -dc '0-9')
+          echo "check_num http=$code body=$body"
+          if [ "$code" = "200" ] && [ -n "$body" ] && [ "$body" -gt 0 ] 2>/dev/null; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "无库存或接口异常，本实例跳过运行。"
+          fi
+
       - name: 运行预编译二进制
+        if: ${{ steps.stock.outputs.run == 'true' }}
         # 二进制为 x86_64-unknown-linux-musl 静态链接，无外部依赖
         # 固定运行 60 秒（RUN_SECONDS）后优雅退出
         # 所有 stdout/stderr 重定向到 /dev/null，不产生任何日志输出
