@@ -1,0 +1,76 @@
+name: USPS Tracker
+
+# 触发方式：
+#  - workflow_dispatch：手动触发，也是“链式接力”自触发用的入口
+#  - schedule：兜底定时，万一接力断了，每小时能自动重新接上
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 * * * *"
+
+# 不设并发互斥：允许上一轮收尾时下一轮已启动，保证“无缝接力、几乎不间断”
+
+jobs:
+  # 单独一个 job 负责：1) 触发下一轮  2) 清理已完成的历史 run，防止记录无限堆积
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 触发下一轮（链式接力）
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          # 程序固定运行 60 秒，这里等 50 秒（接近本轮结束）再触发下一轮，
+          # 形成近乎无缝的接力，同时几乎不产生重叠排队。
+          sleep 50
+          gh workflow run "USPS Tracker" --ref "${{ github.ref_name }}"
+
+      - name: 清理已完成的历史 run
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          # 只删除 status=completed 的 run（正在跑/排队的不动，避免 409/403）。
+          # 同时跳过当前这个 relay 自己所在的 run。
+          # 每次清理一页（最多 100 条），长期运行下足以保持记录精简。
+          ids=$(gh api "repos/$REPO/actions/runs?status=completed&per_page=100" \
+            --jq '.workflow_runs[].id')
+          for id in $ids; do
+            if [ "$id" != "$CURRENT_RUN_ID" ]; then
+              gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null 2>&1 || true
+            fi
+          done
+          echo "cleanup done"
+
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      # 账号并发上限 20：这里 19 个 run + 1 个 relay = 20，正好占满。
+      max-parallel: 19
+      fail-fast: false
+      matrix:
+        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    env:
+      USPS_CLIENT_ID: ${{ secrets.USPS_CLIENT_ID }}
+      USPS_CLIENT_SECRET: ${{ secrets.USPS_CLIENT_SECRET }}
+      NUM_TYPE: big
+      WORKERS: "1"
+      USE_PROXY: "false"
+      RUN_SECONDS: "60"
+      RUST_LOG: info
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 运行预编译二进制
+        # 二进制为 x86_64-unknown-linux-musl 静态链接，无外部依赖
+        # 固定运行 60 秒（RUN_SECONDS）后优雅退出
+        # 所有 stdout/stderr 重定向到 /dev/null，不产生任何日志输出
+        run: |
+          chmod +x ./bin/usps-tracker-rs
+          ./bin/usps-tracker-rs > /dev/null 2>&1
