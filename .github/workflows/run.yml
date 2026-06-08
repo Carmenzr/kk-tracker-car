@@ -1,91 +1,75 @@
 name: USPS Tracker
 
 # 触发方式：
-#  - workflow_dispatch：手动触发，也是“链式接力”自触发用的入口
-#  - schedule：兜底定时，万一接力断了，每小时能自动重新接上
+#  - workflow_dispatch：手动触发，也是“链式心跳”自触发用的入口
+#  - schedule：仅作备用唤醒（GitHub 定时不可靠，主要靠下面的心跳维持）
 on:
   workflow_dispatch:
   schedule:
-    # 兜底探测：每 5 分钟触发一次，若有库存则 relay 会接力持续跑，
-    # 没库存就跑完一轮自然停，直到下次探测发现新库存。
-    - cron: "*/5 * * * *"
+    - cron: "*/30 * * * *"
 
-# 并发互斥：同一 group 同一时刻只允许一个 workflow run。
-# 下一轮被触发后会排队，必须等当前这一轮（含 relay 与全部 run 实例）完全结束才开始，
-# 从根本上杜绝两轮重叠导致并发超出账号上限。
+# 并发互斥：同一时刻只允许一个 workflow run，下一轮排队等当前轮结束再开始，
+# 杜绝两轮重叠导致并发超出账号上限。
 concurrency:
   group: usps-tracker
   cancel-in-progress: false
 
 jobs:
-  # 单独一个 job 负责：1) 触发下一轮  2) 清理已完成的历史 run，防止记录无限堆积
-  relay:
+  # 心跳哨兵：单个轻量 job，循环探测库存。
+  #   - 有货 / 检测异常（网络抖动）-> 放行，启动干活实例
+  #   - 确认没货（200 且 =0）       -> 原地每 60 秒轮询，只占这 1 个 job，
+  #                                    一旦来货立刻放行；轮询满约 10 分钟则交给下一轮接力继续守。
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
+    outputs:
+      work: ${{ steps.poll.outputs.work }}
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 触发下一轮（链式接力，仅在确认没货时才停）
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
+      - name: 探测库存（心跳轮询）
+        id: poll
         run: |
-          # 库存检测：最多重试 3 次。
-          #   - 拿到 HTTP 200 且数字 > 0  -> 有货，触发下一轮
-          #   - 拿到 HTTP 200 且数字 = 0  -> 确认没货，停止接力
-          #   - 网络错误/超时/非200（3 次都没明确结果）-> 不算没货，继续接力（避免抖动误杀）
-          decision=""   # "go" 接力 / "stop" 停止 / "" 未定
-          for i in 1 2 3; do
-            code=$(curl -s -o body.txt -w "%{http_code}" --max-time 15 \
-              "http://43.130.27.95:8082/get_big_check_num" || echo "000")
-            body=$(cat body.txt 2>/dev/null | tr -dc '0-9')
-            echo "attempt $i: http=$code body=$body"
-            if [ "$code" = "200" ] && [ -n "$body" ]; then
-              if [ "$body" -gt 0 ] 2>/dev/null; then decision="go"; else decision="stop"; fi
-              break
+          # 单次探测：重试 3 次，返回 GO（有货）/ EMPTY（确认没货）/ UNKNOWN（检测失败）
+          check_once() {
+            for i in 1 2 3; do
+              code=$(curl -s -o body.txt -w "%{http_code}" --max-time 15 \
+                "http://43.130.27.95:8082/get_big_check_num" || echo "000")
+              body=$(cat body.txt 2>/dev/null | tr -dc '0-9')
+              echo "  try $i: http=$code body=$body" 1>&2
+              if [ "$code" = "200" ] && [ -n "$body" ]; then
+                if [ "$body" -gt 0 ] 2>/dev/null; then echo "GO"; return; else echo "EMPTY"; return; fi
+              fi
+              sleep 3
+            done
+            echo "UNKNOWN"
+          }
+
+          # 最多轮询约 10 分钟（10 次，每次间隔 60s）。
+          for round in $(seq 1 10); do
+            r=$(check_once)
+            echo "poll round $round => $r"
+            if [ "$r" = "GO" ] || [ "$r" = "UNKNOWN" ]; then
+              # 有货，或检测异常（不误杀）-> 放行干活
+              echo "work=true" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
-            sleep 3
+            # EMPTY：确认没货，原地等 60 秒再探（心跳）
+            sleep 60
           done
+          # 轮询期满仍确认没货 -> 本轮不干活（由下一轮接力继续守）
+          echo "work=false" >> "$GITHUB_OUTPUT"
 
-          if [ "$decision" = "stop" ]; then
-            echo "确认无库存（=0），停止接力（等待 schedule 兜底重新检测）。"
-          else
-            # go 或 未定（检测失败）都接力，避免误杀
-            if [ "$decision" = "go" ]; then
-              echo "有库存，触发下一轮。"
-            else
-              echo "检测未取得明确结果（疑似网络抖动），保险起见仍触发下一轮。"
-            fi
-            gh workflow run "USPS Tracker" --ref "${{ github.ref_name }}"
-          fi
-
-      - name: 清理已完成的历史 run
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
-          REPO: ${{ github.repository }}
-          CURRENT_RUN_ID: ${{ github.run_id }}
-        run: |
-          # 只删除 status=completed 的 run（正在跑/排队的不动，避免 409/403）。
-          # 同时跳过当前这个 relay 自己所在的 run。
-          # 每次清理一页（最多 100 条），长期运行下足以保持记录精简。
-          ids=$(gh api "repos/$REPO/actions/runs?status=completed&per_page=100" \
-            --jq '.workflow_runs[].id')
-          for id in $ids; do
-            if [ "$id" != "$CURRENT_RUN_ID" ]; then
-              gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null 2>&1 || true
-            fi
-          done
-          echo "cleanup done"
-
+  # 干活：仅当 check 放行（work=true）才启动这些实例
   run:
+    needs: check
+    if: ${{ needs.check.outputs.work == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
-      # 这里 20 个 run + 1 个 relay = 21，超过账号 20 上限，relay 会排队稍后启动。
-      max-parallel: 20
+      # 19 个 run + 1 个 relay = 20，正好占满账号并发上限（check 此时已结束，不占名额）。
+      max-parallel: 19
       fail-fast: false
       matrix:
-        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
     env:
       USPS_CLIENT_ID: ${{ secrets.USPS_CLIENT_ID }}
       USPS_CLIENT_SECRET: ${{ secrets.USPS_CLIENT_SECRET }}
@@ -98,37 +82,40 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 自检库存（仅确认没货时才跳过）
-        id: stock
-        run: |
-          # 与 relay 相同的判定：最多重试 3 次。
-          #   - 200 且 >0 -> run=true（运行）
-          #   - 200 且 =0 -> run=false（确认没货，跳过）
-          #   - 检测失败（网络/超时/非200）-> run=true（不误杀，照常运行）
-          decision=""
-          for i in 1 2 3; do
-            code=$(curl -s -o body.txt -w "%{http_code}" --max-time 15 \
-              "http://43.130.27.95:8082/get_big_check_num" || echo "000")
-            body=$(cat body.txt 2>/dev/null | tr -dc '0-9')
-            echo "attempt $i: http=$code body=$body"
-            if [ "$code" = "200" ] && [ -n "$body" ]; then
-              if [ "$body" -gt 0 ] 2>/dev/null; then decision="go"; else decision="stop"; fi
-              break
-            fi
-            sleep 3
-          done
-          if [ "$decision" = "stop" ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "确认无库存（=0），本实例跳过运行。"
-          else
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: 运行预编译二进制
-        if: ${{ steps.stock.outputs.run == 'true' }}
         # 二进制为 x86_64-unknown-linux-musl 静态链接，无外部依赖
-        # 固定运行 60 秒（RUN_SECONDS）后优雅退出
-        # 所有 stdout/stderr 重定向到 /dev/null，不产生任何日志输出
+        # 固定运行 60 秒（RUN_SECONDS）后优雅退出，输出全部丢弃不产生日志
         run: |
           chmod +x ./bin/usps-tracker-rs
           ./bin/usps-tracker-rs > /dev/null 2>&1
+
+  # 接力 + 清理：无论本轮有没有货都再触发下一轮，保持心跳永不熄火
+  relay:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 触发下一轮（保持心跳）
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          # 有 concurrency 互斥兜底，立即触发下一轮即可（会排队等本轮结束）。
+          gh workflow run "USPS Tracker" --ref "${{ github.ref_name }}"
+
+      - name: 清理已完成的历史 run
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          ids=$(gh api "repos/$REPO/actions/runs?status=completed&per_page=100" \
+            --jq '.workflow_runs[].id')
+          for id in $ids; do
+            if [ "$id" != "$CURRENT_RUN_ID" ]; then
+              gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null 2>&1 || true
+            fi
+          done
+          echo "cleanup done"
