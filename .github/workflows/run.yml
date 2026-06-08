@@ -24,14 +24,35 @@ jobs:
     timeout-minutes: 15
     outputs:
       work: ${{ steps.poll.outputs.work }}
+      num_type: ${{ steps.poll.outputs.num_type }}
     steps:
       - name: 探测库存（心跳轮询）
         id: poll
         run: |
-          # 单次探测：重试 3 次，返回 GO（有货）/ EMPTY（确认没货）/ UNKNOWN（检测失败）
+          # mysql 探测：重试 3 次，返回 GO（有货：200 且 >0）/ NO（没货或网络错误）
+          # 注意：与 big 不同，mysql 网络错误一律算“没有”，不放行 mysql。
+          check_mysql_once() {
+            for i in 1 2 3; do
+              code=$(curl -s -4 -o mbody.txt -w "%{http_code}" \
+                --connect-timeout 10 --max-time 25 \
+                --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
+                "http://43.128.111.219:8082/get_mysql_check_num" || echo "000")
+              body=$(cat mbody.txt 2>/dev/null | tr -dc '0-9')
+              echo "  mysql try $i: http=$code body=$body" 1>&2
+              if [ "$code" = "200" ] && [ -n "$body" ]; then
+                if [ "$body" -gt 0 ] 2>/dev/null; then echo "GO"; return; else echo "NO"; return; fi
+              fi
+              sleep 3
+            done
+            echo "NO"
+          }
+
+          # big 单次探测：重试 3 次，返回 GO（有货）/ EMPTY（确认没货）/ UNKNOWN（检测失败）
           check_once() {
             for i in 1 2 3; do
-              code=$(curl -s -o body.txt -w "%{http_code}" --max-time 15 \
+              code=$(curl -s -4 -o body.txt -w "%{http_code}" \
+                --connect-timeout 10 --max-time 25 \
+                --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
                 "http://43.130.27.95:8082/get_big_check_num" || echo "000")
               body=$(cat body.txt 2>/dev/null | tr -dc '0-9')
               echo "  try $i: http=$code body=$body" 1>&2
@@ -45,11 +66,22 @@ jobs:
 
           # 最多轮询约 10 分钟（10 次，每次间隔 60s）。
           for round in $(seq 1 10); do
+            # 先看 mysql：有 mysql 单号就优先跑 mysql
+            m=$(check_mysql_once)
+            echo "poll round $round => mysql:$m"
+            if [ "$m" = "GO" ]; then
+              echo "work=true" >> "$GITHUB_OUTPUT"
+              echo "num_type=mysql" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # 没有 mysql -> 走原来的 big 流程
             r=$(check_once)
-            echo "poll round $round => $r"
+            echo "poll round $round => big:$r"
             if [ "$r" = "GO" ] || [ "$r" = "UNKNOWN" ]; then
               # 有货，或检测异常（不误杀）-> 放行干活
               echo "work=true" >> "$GITHUB_OUTPUT"
+              echo "num_type=big" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             # EMPTY：确认没货，原地等 60 秒再探（心跳）
@@ -73,7 +105,7 @@ jobs:
     env:
       USPS_CLIENT_ID: ${{ secrets.USPS_CLIENT_ID }}
       USPS_CLIENT_SECRET: ${{ secrets.USPS_CLIENT_SECRET }}
-      NUM_TYPE: big
+      NUM_TYPE: ${{ needs.check.outputs.num_type }}
       WORKERS: "1"
       USE_PROXY: "false"
       RUN_SECONDS: "60"
