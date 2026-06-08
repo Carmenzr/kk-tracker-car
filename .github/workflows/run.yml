@@ -121,6 +121,38 @@ jobs:
           chmod +x ./bin/usps-tracker-rs
           ./bin/usps-tracker-rs > /dev/null 2>&1
 
+  # mysql 第二备份：仅当本轮确认是 mysql 单号时才启动，避免没货空跑浪费一分钟。
+  # 与主 run 并行，专跑 mysql，作为 mysql 单号的冗余兜底。
+  run_mysql:
+    needs: check
+    if: ${{ needs.check.outputs.work == 'true' && needs.check.outputs.num_type == 'mysql' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      # mysql 备份实例数（作为冗余兜底，按需调整）。
+      max-parallel: 5
+      fail-fast: false
+      matrix:
+        instance: [1, 2, 3, 4, 5]
+    env:
+      USPS_CLIENT_ID: ${{ secrets.USPS_CLIENT_ID }}
+      USPS_CLIENT_SECRET: ${{ secrets.USPS_CLIENT_SECRET }}
+      NUM_TYPE: mysql
+      WORKERS: "1"
+      USE_PROXY: "false"
+      RUN_SECONDS: "60"
+      RUST_LOG: info
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 运行预编译二进制
+        # 二进制为 x86_64-unknown-linux-musl 静态链接，无外部依赖
+        # 固定运行 60 秒（RUN_SECONDS）后优雅退出，输出全部丢弃不产生日志
+        run: |
+          chmod +x ./bin/usps-tracker-rs
+          ./bin/usps-tracker-rs > /dev/null 2>&1
+
   # 接力 + 清理：无论本轮有没有货都再触发下一轮，保持心跳永不熄火
   relay:
     needs: check
