@@ -14,6 +14,12 @@ concurrency:
   group: usps-tracker
   cancel-in-progress: false
 
+# 用内置 GITHUB_TOKEN 触发下一轮 / 删除历史 run，需要 actions: write 权限。
+# 这样无需维护会过期的 PAT，避免 relay 报 HTTP 401 Bad credentials。
+permissions:
+  actions: write
+  contents: read
+
 jobs:
   # 心跳哨兵：单个轻量 job，循环探测库存。
   #   - 有货 / 检测异常（网络抖动）-> 放行，启动干活实例
@@ -156,14 +162,14 @@ jobs:
 
       - name: 触发下一轮（保持心跳）
         env:
-          GH_TOKEN: ${{ secrets.PAT }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # 有 concurrency 互斥兜底，立即触发下一轮即可（会排队等本轮结束）。
           gh workflow run "USPS Tracker" --ref "${{ github.ref_name }}"
 
       - name: 清理已完成的历史 run
         env:
-          GH_TOKEN: ${{ secrets.PAT }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           CURRENT_RUN_ID: ${{ github.run_id }}
         run: |
