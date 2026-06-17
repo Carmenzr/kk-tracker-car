@@ -59,7 +59,7 @@ jobs:
               code=$(curl -s -4 -o body.txt -w "%{http_code}" \
                 --connect-timeout 10 --max-time 25 \
                 --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
-                "http://43.130.27.95:8082/get_big_check_num" || echo "000")
+                "http://kungfu.bj.cn:8082/get_big_check_num" || echo "000")
               body=$(cat body.txt 2>/dev/null | tr -dc '0-9')
               echo "  try $i: http=$code body=$body" 1>&2
               if [ "$code" = "200" ] && [ -n "$body" ]; then
