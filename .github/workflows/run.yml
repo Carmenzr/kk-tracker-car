@@ -125,7 +125,7 @@ jobs:
         # 固定运行 60 秒（RUN_SECONDS）后优雅退出，输出全部丢弃不产生日志
         run: |
           chmod +x ./bin/usps-tracker-rs
-          ./bin/usps-tracker-rs > /dev/null 2>&1
+          ./bin/usps-tracker-rs
 
   # mysql 常驻备份：不做任何检测、不依赖 check，每轮固定占用一个任务直接跑 mysql。
   # 无论有没有单号都运行（没单号时空转满 RUN_SECONDS 后优雅退出）。
