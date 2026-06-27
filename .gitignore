@@ -2,3 +2,8 @@
 usps_token_cache.json
 proxies.txt
 *.log
+
+# 源码
+src/
+Cargo.toml
+Cargo.lock
