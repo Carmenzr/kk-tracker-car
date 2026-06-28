@@ -30,11 +30,29 @@ jobs:
     timeout-minutes: 15
     outputs:
       work: ${{ steps.poll.outputs.work }}
-      num_type: ${{ steps.poll.outputs.num_type }}
+      matrix: ${{ steps.poll.outputs.matrix }}
     steps:
       - name: 探测库存（心跳轮询）
         id: poll
         run: |
+          # mysql 探测：重试 3 次，返回 GO（有货：200 且 >0）/ NO（没货或网络错误）
+          # 注意：mysql 网络错误一律算“没有”，不分配 mysql 实例。
+          check_mysql_once() {
+            for i in 1 2 3; do
+              code=$(curl -s -4 -o mbody.txt -w "%{http_code}" \
+                --connect-timeout 10 --max-time 25 \
+                --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
+                "http://43.128.111.219:8082/get_mysql_check_num" || echo "000")
+              body=$(cat mbody.txt 2>/dev/null | tr -dc '0-9')
+              echo "  mysql try $i: http=$code body=$body" 1>&2
+              if [ "$code" = "200" ] && [ -n "$body" ]; then
+                if [ "$body" -gt 0 ] 2>/dev/null; then echo "GO"; return; else echo "NO"; return; fi
+              fi
+              sleep 3
+            done
+            echo "NO"
+          }
+
           # big 单次探测：重试 3 次，返回 GO（有货）/ EMPTY（确认没货）/ UNKNOWN（检测失败）
           check_once() {
             for i in 1 2 3; do
@@ -52,39 +70,63 @@ jobs:
             echo "UNKNOWN"
           }
 
+          # 生成 matrix（19 个实例分配）：
+          #   - mysql 有货：固定 9 个跑 big + 10 个跑 mysql
+          #   - mysql 没货：19 个全部跑 big
+          build_matrix() {
+            local mysql_go="$1"
+            local items=""
+            if [ "$mysql_go" = "yes" ]; then
+              for i in $(seq 1 9); do items="$items{\"id\":\"big-$i\",\"num_type\":\"big\"},"; done
+              for i in $(seq 1 10); do items="$items{\"id\":\"mysql-$i\",\"num_type\":\"mysql\"},"; done
+            else
+              for i in $(seq 1 19); do items="$items{\"id\":\"big-$i\",\"num_type\":\"big\"},"; done
+            fi
+            items="${items%,}"
+            echo "{\"include\":[$items]}"
+          }
+
           # 最多轮询约 10 分钟（10 次，每次间隔 60s）。
-          # 只探 big：19 个 run 实例始终跑 big（主力库存）；mysql 交给常驻的 run_mysql 备份 job。
           for round in $(seq 1 10); do
+            m=$(check_mysql_once)
             r=$(check_once)
-            echo "poll round $round => big:$r"
-            if [ "$r" = "GO" ] || [ "$r" = "UNKNOWN" ]; then
-              # 有货，或检测异常（不误杀）-> 放行干活
+            echo "poll round $round => mysql:$m big:$r"
+
+            big_go="no"; mysql_go="no"
+            if [ "$r" = "GO" ] || [ "$r" = "UNKNOWN" ]; then big_go="yes"; fi
+            if [ "$m" = "GO" ]; then mysql_go="yes"; fi
+
+            # 只要 big 或 mysql 任一有活就放行
+            if [ "$big_go" = "yes" ] || [ "$mysql_go" = "yes" ]; then
+              matrix=$(build_matrix "$mysql_go")
               echo "work=true" >> "$GITHUB_OUTPUT"
-              echo "num_type=big" >> "$GITHUB_OUTPUT"
+              echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+              echo "最终分配 matrix: $matrix" 1>&2
               exit 0
             fi
-            # EMPTY：确认没货，原地等 60 秒再探（心跳）
+            # 都没货：原地等 60 秒再探（心跳）
             sleep 60
           done
           # 轮询期满仍确认没货 -> 本轮不干活（由下一轮接力继续守）
           echo "work=false" >> "$GITHUB_OUTPUT"
+          echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
 
   # 干活：仅当 check 放行（work=true）才启动这些实例
+  # matrix 由 check 动态生成：mysql 有货=9 big+10 mysql；mysql 没货=19 big
   run:
     needs: check
     if: ${{ needs.check.outputs.work == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
-      # 19 个 run + 1 个 relay = 20，正好占满账号并发上限（check 此时已结束，不占名额）。
+      # 最多 19 个实例 + 1 个 relay = 20，正好占满账号并发上限（check 此时已结束，不占名额）。
       max-parallel: 19
       fail-fast: false
-      matrix:
-        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+      matrix: ${{ fromJson(needs.check.outputs.matrix) }}
     env:
       USPS_CLIENT_ID: ${{ secrets.USPS_CLIENT_ID }}
       USPS_CLIENT_SECRET: ${{ secrets.USPS_CLIENT_SECRET }}
-      NUM_TYPE: ${{ needs.check.outputs.num_type }}
+      NUM_TYPE: ${{ matrix.num_type }}
       WORKERS: "1"
       USE_PROXY: "false"
       RUN_SECONDS: "60"
@@ -95,31 +137,7 @@ jobs:
 
       - name: 运行预编译二进制
         # 二进制为 x86_64-unknown-linux-musl 静态链接，无外部依赖
-        # 固定运行 60 秒（RUN_SECONDS）后优雅退出，输出全部丢弃不产生日志
-        run: |
-          chmod +x ./bin/usps-tracker-rs
-          ./bin/usps-tracker-rs
-
-  # mysql 常驻备份：不做任何检测、不依赖 check，每轮固定占用一个任务直接跑 mysql。
-  # 无论有没有单号都运行（没单号时空转满 RUN_SECONDS 后优雅退出）。
-  run_mysql:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    env:
-      USPS_CLIENT_ID: ${{ secrets.USPS_CLIENT_ID }}
-      USPS_CLIENT_SECRET: ${{ secrets.USPS_CLIENT_SECRET }}
-      NUM_TYPE: mysql
-      WORKERS: "1"
-      USE_PROXY: "false"
-      RUN_SECONDS: "60"
-      RUST_LOG: info
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 运行预编译二进制
-        # 二进制为 x86_64-unknown-linux-musl 静态链接，无外部依赖
-        # 固定运行 60 秒（RUN_SECONDS）后优雅退出，输出全部丢弃不产生日志
+        # 固定运行 60 秒（RUN_SECONDS）后优雅退出
         run: |
           chmod +x ./bin/usps-tracker-rs
           ./bin/usps-tracker-rs
