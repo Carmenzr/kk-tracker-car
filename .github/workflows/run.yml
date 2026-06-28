@@ -142,6 +142,28 @@ jobs:
           chmod +x ./bin/usps-tracker-rs
           ./bin/usps-tracker-rs
 
+  # mysql 常驻备份：不做任何检测、不依赖 check，每轮固定占用一个任务直接跑 mysql。
+  # 无论有没有单号都运行（没单号时空转满 RUN_SECONDS 后优雅退出），保证 mysql 始终有覆盖。
+  run_mysql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      USPS_CLIENT_ID: ${{ secrets.USPS_CLIENT_ID }}
+      USPS_CLIENT_SECRET: ${{ secrets.USPS_CLIENT_SECRET }}
+      NUM_TYPE: mysql
+      WORKERS: "1"
+      USE_PROXY: "false"
+      RUN_SECONDS: "60"
+      RUST_LOG: info
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 运行预编译二进制
+        run: |
+          chmod +x ./bin/usps-tracker-rs
+          ./bin/usps-tracker-rs
+
   # 接力 + 清理：无论本轮有没有货都再触发下一轮，保持心跳永不熄火
   relay:
     needs: check
