@@ -42,7 +42,7 @@ jobs:
               code=$(curl -s -4 -o mbody.txt -w "%{http_code}" \
                 --connect-timeout 10 --max-time 25 \
                 --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
-                "http://43.128.111.219:8082/get_mysql_check_num" || echo "000")
+                "http://mysql_frp.kungfu.bj.cn:8082/get_mysql_check_num" || echo "000")
               body=$(cat mbody.txt 2>/dev/null | tr -dc '0-9')
               echo "  mysql try $i: http=$code body=$body" 1>&2
               if [ "$code" = "200" ] && [ -n "$body" ]; then
