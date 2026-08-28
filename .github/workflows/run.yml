@@ -165,8 +165,13 @@ jobs:
           ./bin/usps-tracker-rs
 
   # 接力 + 清理：无论本轮有没有货都再触发下一轮，保持心跳永不熄火
+  # if: always()  —— 关键。check 在库存长时间为空/服务器不可达时会撞上
+  # 自身的 timeout-minutes 被强制取消；默认规则下 needs: check 会导致 relay 被跳过，
+  # 于是下一轮永远不会被触发，整条心跳链就此断掉（表现为“不再自动运行”）。
+  # 用 always() 让 relay 无视 check 的成败/超时，始终触发下一轮，保证心跳不熄火。
   relay:
     needs: check
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
