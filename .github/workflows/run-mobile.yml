@@ -86,15 +86,17 @@ jobs:
             echo "UNKNOWN"
           }
 
-          # 生成 matrix（19 个实例）：mysql 有货=9 big+10 mysql；mysql 没货=19 big
+          # 生成 matrix（8 个实例，控制并发以规避 Akamai 风控）：
+          #   mysql 有货=4 big+4 mysql；mysql 没货=8 big
+          # （移动端 Akamai 挑战较重，实例过多会被限流/挂起；如需增减改这里的数量即可）
           build_matrix() {
             local mysql_go="$1"
             local items=""
             if [ "$mysql_go" = "yes" ]; then
-              for i in $(seq 1 9); do items="$items{\"id\":\"big-$i\",\"num_type\":\"big\"},"; done
-              for i in $(seq 1 10); do items="$items{\"id\":\"mysql-$i\",\"num_type\":\"mysql\"},"; done
+              for i in $(seq 1 4); do items="$items{\"id\":\"big-$i\",\"num_type\":\"big\"},"; done
+              for i in $(seq 1 4); do items="$items{\"id\":\"mysql-$i\",\"num_type\":\"mysql\"},"; done
             else
-              for i in $(seq 1 19); do items="$items{\"id\":\"big-$i\",\"num_type\":\"big\"},"; done
+              for i in $(seq 1 8); do items="$items{\"id\":\"big-$i\",\"num_type\":\"big\"},"; done
             fi
             items="${items%,}"
             echo "{\"include\":[$items]}"
@@ -127,9 +129,9 @@ jobs:
     needs: check
     if: ${{ needs.check.outputs.work == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 6
     strategy:
-      max-parallel: 19
+      max-parallel: 8
       fail-fast: false
       matrix: ${{ fromJson(needs.check.outputs.matrix) }}
     env:
@@ -157,9 +159,19 @@ jobs:
             --output "$BIN_NAME" --clobber
 
       - name: 运行
+        # 硬超时兜底：150s 发 SIGTERM，再 20s 未退则 SIGKILL。
+        # 二进制正常约 60s 后自行优雅退出；万一个别实例被 Akamai 风控挂起，
+        # 也能被强制终止，绝不空耗到 job 超时。运行中结果是分批实时提交的，
+        # 被终止最多只丢最后一小批。
         run: |
           chmod +x "$BIN_NAME"
-          "./$BIN_NAME"
+          set +e
+          timeout -k 20 150 "./$BIN_NAME"
+          ec=$?
+          case "$ec" in
+            0|124|137|143) echo "运行结束（退出码 $ec，视为正常收尾）"; exit 0 ;;
+            *) echo "::warning::二进制异常退出，退出码 $ec"; exit 0 ;;
+          esac
 
   # 接力 + 清理：无论本轮有没有货都再触发下一轮，保持心跳永不熄火
   relay:
