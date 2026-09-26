@@ -1,51 +1,190 @@
 name: USPS Mobile Big
 
-# 运行移动端(Akamai)大单号追踪二进制 usps-mobile-big
-# 二进制体积 >100MB(内含 iv8 + V8)，超过 git 单文件上限，故以 Release 资产分发，
-# 运行时下载。
+# 移动端(Akamai) 单号追踪心跳：完整替代旧的 Rust "USPS Tracker" 工作流。
+# 二进制 usps-mobile-big(>100MB, 内含 iv8+V8) 以 Release 资产(tag=mobile-bin)分发，
+# 运行时下载并用 Actions 缓存复用，避免每轮重复拉取。
+#
 # 触发方式：
-#   - workflow_dispatch：手动触发（默认）
-#   - schedule：定时常驻（默认注释掉；启用前请注意与 "USPS Tracker" 心跳
-#     共用同一账号的并发上限，两个心跳同时开会互相排队）
+#   - workflow_dispatch：手动触发，也是“链式心跳”自触发入口
+#   - schedule：备用唤醒（GitHub 定时不可靠，主要靠 relay 维持心跳）
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: "*/30 * * * *"
+  schedule:
+    - cron: "*/30 * * * *"
 
-# 独立并发组，和 Rust 那套 (group: usps-tracker) 分开，互不取消
+# 并发互斥：同一时刻只允许一个 run，下一轮排队等当前轮结束再开始。
 concurrency:
   group: usps-mobile-big
   cancel-in-progress: false
 
-# 下载 Release 资产需要读权限
+# relay 用内置 GITHUB_TOKEN 触发下一轮 / 删除历史 run，需要 actions: write。
 permissions:
+  actions: write
   contents: read
 
-# 二进制所在的 Release 标签
 env:
   BIN_TAG: mobile-bin
   BIN_NAME: usps-mobile-big
 
 jobs:
+  # 心跳哨兵：探测库存并生成实例分配 matrix；同时算出二进制版本号用于缓存键。
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      work: ${{ steps.poll.outputs.work }}
+      matrix: ${{ steps.poll.outputs.matrix }}
+      binver: ${{ steps.binver.outputs.binver }}
+    steps:
+      - name: 计算二进制版本（缓存键）
+        id: binver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver=$(gh release view "$BIN_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '.assets[] | select(.name=="'"$BIN_NAME"'") | .updatedAt' 2>/dev/null \
+            | tr -cd '[:alnum:]')
+          [ -z "$ver" ] && ver="none"
+          echo "binver=$ver" >> "$GITHUB_OUTPUT"
+          echo "二进制版本: $ver" 1>&2
+
+      - name: 探测库存（心跳轮询）
+        id: poll
+        run: |
+          # mysql 探测：返回 GO(有货:200且>0) / NO(没货或网络错误)。网络错误一律算没有。
+          check_mysql_once() {
+            for i in 1 2 3; do
+              code=$(curl -s -4 -o mbody.txt -w "%{http_code}" \
+                --connect-timeout 10 --max-time 25 \
+                --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
+                "http://mysql_frp.kungfu.bj.cn:8082/get_mysql_check_num" || echo "000")
+              body=$(cat mbody.txt 2>/dev/null | tr -dc '0-9')
+              echo "  mysql try $i: http=$code body=$body" 1>&2
+              if [ "$code" = "200" ] && [ -n "$body" ]; then
+                if [ "$body" -gt 0 ] 2>/dev/null; then echo "GO"; return; else echo "NO"; return; fi
+              fi
+              sleep 3
+            done
+            echo "NO"
+          }
+
+          # big 探测：GO(有货) / EMPTY(确认没货) / UNKNOWN(检测失败)
+          check_once() {
+            for i in 1 2 3; do
+              code=$(curl -s -4 -o body.txt -w "%{http_code}" \
+                --connect-timeout 10 --max-time 25 \
+                --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
+                "http://kungfu.bj.cn:8082/get_big_check_num" || echo "000")
+              body=$(cat body.txt 2>/dev/null | tr -dc '0-9')
+              echo "  try $i: http=$code body=$body" 1>&2
+              if [ "$code" = "200" ] && [ -n "$body" ]; then
+                if [ "$body" -gt 0 ] 2>/dev/null; then echo "GO"; return; else echo "EMPTY"; return; fi
+              fi
+              sleep 3
+            done
+            echo "UNKNOWN"
+          }
+
+          # 生成 matrix（19 个实例）：mysql 有货=9 big+10 mysql；mysql 没货=19 big
+          build_matrix() {
+            local mysql_go="$1"
+            local items=""
+            if [ "$mysql_go" = "yes" ]; then
+              for i in $(seq 1 9); do items="$items{\"id\":\"big-$i\",\"num_type\":\"big\"},"; done
+              for i in $(seq 1 10); do items="$items{\"id\":\"mysql-$i\",\"num_type\":\"mysql\"},"; done
+            else
+              for i in $(seq 1 19); do items="$items{\"id\":\"big-$i\",\"num_type\":\"big\"},"; done
+            fi
+            items="${items%,}"
+            echo "{\"include\":[$items]}"
+          }
+
+          # 最多轮询约 10 分钟（10 次，每次间隔 60s）
+          for round in $(seq 1 10); do
+            m=$(check_mysql_once)
+            r=$(check_once)
+            echo "poll round $round => mysql:$m big:$r"
+
+            big_go="no"; mysql_go="no"
+            if [ "$r" = "GO" ] || [ "$r" = "UNKNOWN" ]; then big_go="yes"; fi
+            if [ "$m" = "GO" ]; then mysql_go="yes"; fi
+
+            if [ "$big_go" = "yes" ] || [ "$mysql_go" = "yes" ]; then
+              matrix=$(build_matrix "$mysql_go")
+              echo "work=true" >> "$GITHUB_OUTPUT"
+              echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+              echo "最终分配 matrix: $matrix" 1>&2
+              exit 0
+            fi
+            sleep 60
+          done
+          echo "work=false" >> "$GITHUB_OUTPUT"
+          echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+
+  # 干活：仅当 check 放行（work=true）才启动
   run:
+    needs: check
+    if: ${{ needs.check.outputs.work == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
-      # 并发实例数：每个实例内部再跑 3 个 worker，二进制固定运行约 60 秒后优雅退出
+      max-parallel: 19
       fail-fast: false
-      matrix:
-        id: [1, 2, 3]
+      matrix: ${{ fromJson(needs.check.outputs.matrix) }}
+    env:
+      NUM_TYPE: ${{ matrix.num_type }}
+      WORKERS: "1"
+      BATCH_SIZE: "30"
+      USE_PROXY: "false"
+      RUN_SECONDS: "60"
     steps:
-      - name: 下载移动端二进制（Release 资产）
+      - name: 缓存二进制
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BIN_NAME }}
+          key: ${{ env.BIN_NAME }}-${{ needs.check.outputs.binver }}
+
+      - name: 下载二进制（缓存未命中时）
+        if: steps.cache.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release download "$BIN_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern "$BIN_NAME" \
-            --output "$BIN_NAME"
-          chmod +x "$BIN_NAME"
+            --output "$BIN_NAME" --clobber
 
       - name: 运行
-        # 二进制为 x86_64 Linux ELF（PyInstaller 单文件，内含 iv8 + polyfill.js）
-        run: ./usps-mobile-big
+        run: |
+          chmod +x "$BIN_NAME"
+          "./$BIN_NAME"
+
+  # 接力 + 清理：无论本轮有没有货都再触发下一轮，保持心跳永不熄火
+  relay:
+    needs: check
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 触发下一轮（保持心跳）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run "USPS Mobile Big" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}"
+
+      - name: 清理已完成的历史 run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          ids=$(gh api "repos/$REPO/actions/runs?status=completed&per_page=100" \
+            --jq '.workflow_runs[].id')
+          for id in $ids; do
+            if [ "$id" != "$CURRENT_RUN_ID" ]; then
+              gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null 2>&1 || true
+            fi
+          done
+          echo "cleanup done"
