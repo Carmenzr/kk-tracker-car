@@ -140,6 +140,8 @@ jobs:
       BATCH_SIZE: "30"
       USE_PROXY: "false"
       RUN_SECONDS: "60"
+      # 整个会话走这个住宅代理(挑战+查询同一出口)；日志里已脱敏
+      PROXY: ${{ secrets.PROXY }}
     steps:
       - name: 缓存二进制
         id: cache
