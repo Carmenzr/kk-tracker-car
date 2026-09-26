@@ -86,17 +86,17 @@ jobs:
             echo "UNKNOWN"
           }
 
-          # 生成 matrix（8 个实例，控制并发以规避 Akamai 风控）：
-          #   mysql 有货=4 big+4 mysql；mysql 没货=8 big
-          # （移动端 Akamai 挑战较重，实例过多会被限流/挂起；如需增减改这里的数量即可）
+          # 生成 matrix（19 个实例，开满账号并发）：
+          #   mysql 有货=9 big+10 mysql；mysql 没货=19 big
+          # 单实例有 150s 硬超时兜底，个别被 Akamai 风控挂起也会被强杀，不会拖垮整体。
           build_matrix() {
             local mysql_go="$1"
             local items=""
             if [ "$mysql_go" = "yes" ]; then
-              for i in $(seq 1 4); do items="$items{\"id\":\"big-$i\",\"num_type\":\"big\"},"; done
-              for i in $(seq 1 4); do items="$items{\"id\":\"mysql-$i\",\"num_type\":\"mysql\"},"; done
+              for i in $(seq 1 9); do items="$items{\"id\":\"big-$i\",\"num_type\":\"big\"},"; done
+              for i in $(seq 1 10); do items="$items{\"id\":\"mysql-$i\",\"num_type\":\"mysql\"},"; done
             else
-              for i in $(seq 1 8); do items="$items{\"id\":\"big-$i\",\"num_type\":\"big\"},"; done
+              for i in $(seq 1 19); do items="$items{\"id\":\"big-$i\",\"num_type\":\"big\"},"; done
             fi
             items="${items%,}"
             echo "{\"include\":[$items]}"
@@ -131,7 +131,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 6
     strategy:
-      max-parallel: 8
+      max-parallel: 19
       fail-fast: false
       matrix: ${{ fromJson(needs.check.outputs.matrix) }}
     env:
