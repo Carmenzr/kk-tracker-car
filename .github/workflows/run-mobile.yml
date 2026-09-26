@@ -160,6 +160,12 @@ jobs:
             --pattern "$BIN_NAME" \
             --output "$BIN_NAME" --clobber
 
+      - name: 随机错峰（避免 19 个相同客户端同时发起挑战）
+        run: |
+          jitter=$((RANDOM % 61))
+          echo "实例 ${{ matrix.id }} 延迟 ${jitter}s 后启动"
+          sleep "$jitter"
+
       - name: 运行
         # 硬超时兜底：150s 发 SIGTERM，再 20s 未退则 SIGKILL。
         # 二进制正常约 60s 后自行优雅退出；万一个别实例被 Akamai 风控挂起，
@@ -175,17 +181,21 @@ jobs:
             *) echo "::warning::二进制异常退出，退出码 $ec"; exit 0 ;;
           esac
 
-  # 接力 + 清理：无论本轮有没有货都再触发下一轮，保持心跳永不熄火
+  # 接力 + 清理：等待本轮所有实例结束，再冷却后触发下一轮。
+  # 旧实现 relay 只依赖 check，会在 run 刚启动时就把下一轮排队；当前轮一结束，
+  # 下一轮立刻再次 19 路挑战，容易触发短时频控。
   relay:
-    needs: check
+    needs: [check, run]
     if: ${{ always() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 7
     steps:
-      - name: 触发下一轮（保持心跳）
+      - name: 冷却后触发下一轮（保持心跳）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          echo "本轮实例已结束，冷却 180 秒后启动下一轮"
+          sleep 180
           gh workflow run "USPS Mobile Big" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}"
 
       - name: 清理已完成的历史 run
