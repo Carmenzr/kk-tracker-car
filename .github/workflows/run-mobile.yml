@@ -1,0 +1,51 @@
+name: USPS Mobile Big
+
+# 运行移动端(Akamai)大单号追踪二进制 usps-mobile-big
+# 二进制体积 >100MB(内含 iv8 + V8)，超过 git 单文件上限，故以 Release 资产分发，
+# 运行时下载。
+# 触发方式：
+#   - workflow_dispatch：手动触发（默认）
+#   - schedule：定时常驻（默认注释掉；启用前请注意与 "USPS Tracker" 心跳
+#     共用同一账号的并发上限，两个心跳同时开会互相排队）
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "*/30 * * * *"
+
+# 独立并发组，和 Rust 那套 (group: usps-tracker) 分开，互不取消
+concurrency:
+  group: usps-mobile-big
+  cancel-in-progress: false
+
+# 下载 Release 资产需要读权限
+permissions:
+  contents: read
+
+# 二进制所在的 Release 标签
+env:
+  BIN_TAG: mobile-bin
+  BIN_NAME: usps-mobile-big
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      # 并发实例数：每个实例内部再跑 3 个 worker，二进制固定运行约 60 秒后优雅退出
+      fail-fast: false
+      matrix:
+        id: [1, 2, 3]
+    steps:
+      - name: 下载移动端二进制（Release 资产）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$BIN_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$BIN_NAME" \
+            --output "$BIN_NAME"
+          chmod +x "$BIN_NAME"
+
+      - name: 运行
+        # 二进制为 x86_64 Linux ELF（PyInstaller 单文件，内含 iv8 + polyfill.js）
+        run: ./usps-mobile-big
