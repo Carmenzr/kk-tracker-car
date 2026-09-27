@@ -145,9 +145,7 @@ jobs:
       CHALLENGE_ENGINE: jsdom
       # 整个会话走这个住宅代理(挑战+查询同一出口)；日志里已脱敏。jsdom 仅支持 http/https 代理。
       PROXY: ${{ secrets.PROXY }}
-      # 单号服务器地址：设了同名 secret 就用 secret，否则回落源码默认值（空串也回落）。
-      DANHAO_HOST: ${{ secrets.DANHAO_HOST }}
-      DANHAO_MYSQL_HOST: ${{ secrets.DANHAO_MYSQL_HOST }}
+      # 单号服务器地址已在源码中明文写死默认值，无需 secret 注入。
     steps:
       - name: 检出源码
         uses: actions/checkout@v4

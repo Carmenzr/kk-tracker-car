@@ -42,13 +42,13 @@ logging.info("挑战引擎(CHALLENGE_ENGINE): %s -> %s",
              _CHALLENGE_ENGINE,
              "usps_track_jsdom" if _CHALLENGE_ENGINE == "jsdom" else "usps_track")
 
-# 单号服务器地址：真实地址一律从环境变量注入（本地导出 env / GitHub 用 secret），
-# 源码里只留本地占位符，避免内网地址明文进公共仓库。
-# 用 or 而非 get 默认值：空串(未设的 secret)也回落占位符，不会被覆盖成空。
-#   本地生产运行： $env:DANHAO_HOST="真实:端口"; $env:DANHAO_MYSQL_HOST="真实:端口"
-#   GitHub：仓库 Secrets 添加 DANHAO_HOST / DANHAO_MYSQL_HOST
-danhao_server_host_mysql = os.environ.get('DANHAO_MYSQL_HOST') or '127.0.0.1:8082'
-danhao_server_host = os.environ.get('DANHAO_HOST') or '127.0.0.1:8082'
+# 单号服务器地址（明文默认；也可用环境变量 DANHAO_HOST / DANHAO_MYSQL_HOST 覆盖）
+danhao_server_host_mysql = os.environ.get('DANHAO_MYSQL_HOST') or 'mysql_frp.kungfu.bj.cn:8082'
+danhao_server_host = os.environ.get('DANHAO_HOST') or 'kungfu.bj.cn:8082'
+# danhao_server_host='127.0.0.1:8082'
+
+# 启动打印实际使用的单号服务器，便于排查“无新单号”等问题
+logging.info("单号服务器: big=%s mysql=%s", danhao_server_host, danhao_server_host_mysql)
 
 # ---------------------------------------------------------------- 移动端解析
 # USPS 移动端查询结果结构：一次可传多个 tLabels（逗号分隔），返回一个
