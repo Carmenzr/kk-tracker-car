@@ -86,18 +86,17 @@ jobs:
             echo "UNKNOWN"
           }
 
-          # 生成 matrix（5 个实例，先以可用吞吐为目标）：
-          #   mysql 有货=3 big+2 mysql；mysql 没货=5 big
-          # 实测 GitHub Ubuntu 顺序挑战 10/10，但 19 路同步挑战会降为 0/19；
-          # 因此先从 5 路稳定运行，再按 5→8→12 阶梯提高，不能直接开满 19。
+          # 生成 matrix（19 个实例，开满账号并发）：
+          #   mysql 有货=9 big+10 mysql；mysql 没货=19 big
+          # 单实例有 150s 硬超时兜底，个别被 Akamai 风控挂起也会被强杀，不会拖垮整体。
           build_matrix() {
             local mysql_go="$1"
             local items=""
             if [ "$mysql_go" = "yes" ]; then
-              for i in $(seq 1 3); do items="$items{\"id\":\"big-$i\",\"num_type\":\"big\"},"; done
-              for i in $(seq 1 2); do items="$items{\"id\":\"mysql-$i\",\"num_type\":\"mysql\"},"; done
+              for i in $(seq 1 9); do items="$items{\"id\":\"big-$i\",\"num_type\":\"big\"},"; done
+              for i in $(seq 1 10); do items="$items{\"id\":\"mysql-$i\",\"num_type\":\"mysql\"},"; done
             else
-              for i in $(seq 1 5); do items="$items{\"id\":\"big-$i\",\"num_type\":\"big\"},"; done
+              for i in $(seq 1 19); do items="$items{\"id\":\"big-$i\",\"num_type\":\"big\"},"; done
             fi
             items="${items%,}"
             echo "{\"include\":[$items]}"
@@ -132,7 +131,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 6
     strategy:
-      max-parallel: 5
+      max-parallel: 19
       fail-fast: false
       matrix: ${{ fromJson(needs.check.outputs.matrix) }}
     env:
@@ -161,12 +160,6 @@ jobs:
             --pattern "$BIN_NAME" \
             --output "$BIN_NAME" --clobber
 
-      - name: 随机错峰（避免多个相同客户端同时发起挑战）
-        run: |
-          jitter=$((RANDOM % 61))
-          echo "实例 ${{ matrix.id }} 延迟 ${jitter}s 后启动"
-          sleep "$jitter"
-
       - name: 运行
         # 硬超时兜底：150s 发 SIGTERM，再 20s 未退则 SIGKILL。
         # 二进制正常约 60s 后自行优雅退出；万一个别实例被 Akamai 风控挂起，
@@ -182,21 +175,17 @@ jobs:
             *) echo "::warning::二进制异常退出，退出码 $ec"; exit 0 ;;
           esac
 
-  # 接力 + 清理：等待本轮所有实例结束，再冷却后触发下一轮。
-  # 旧实现 relay 只依赖 check，会在 run 刚启动时就把下一轮排队；当前轮一结束，
-  # 下一轮立刻再次 19 路挑战，容易触发短时频控。
+  # 接力 + 清理：无论本轮有没有货都再触发下一轮，保持心跳永不熄火
   relay:
-    needs: [check, run]
+    needs: check
     if: ${{ always() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 7
+    timeout-minutes: 5
     steps:
-      - name: 冷却后触发下一轮（保持心跳）
+      - name: 触发下一轮（保持心跳）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "本轮实例已结束，冷却 180 秒后启动下一轮"
-          sleep 180
           gh workflow run "USPS Mobile Big" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}"
 
       - name: 清理已完成的历史 run
