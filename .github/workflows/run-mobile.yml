@@ -124,7 +124,8 @@ jobs:
           echo "work=false" >> "$GITHUB_OUTPUT"
           echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
 
-  # 干活：仅当 check 放行（work=true）才启动
+  # 干活：仅当 check 放行（work=true）才启动。
+  # 引擎 = jsdom：直接用源码 + runner 自带的 Node/Python 跑，不再下载 iv8 二进制。
   run:
     needs: check
     if: ${{ needs.check.outputs.work == 'true' }}
@@ -140,39 +141,45 @@ jobs:
       BATCH_SIZE: "30"
       USE_PROXY: "false"
       RUN_SECONDS: "300"
-      # 整个会话走这个住宅代理(挑战+查询同一出口)；日志里已脱敏
+      # 挑战引擎：jsdom（Node 子进程）。改回 iv8 需换回二进制方案，仅改此处无效。
+      CHALLENGE_ENGINE: jsdom
+      # 整个会话走这个住宅代理(挑战+查询同一出口)；日志里已脱敏。jsdom 仅支持 http/https 代理。
       PROXY: ${{ secrets.PROXY }}
+      # 单号服务器地址：设了同名 secret 就用 secret，否则回落源码默认值（空串也回落）。
+      DANHAO_HOST: ${{ secrets.DANHAO_HOST }}
+      DANHAO_MYSQL_HOST: ${{ secrets.DANHAO_MYSQL_HOST }}
     steps:
-      - name: 缓存二进制
-        id: cache
-        uses: actions/cache@v4
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node（带 npm 缓存）
+        uses: actions/setup-node@v4
         with:
-          path: ${{ env.BIN_NAME }}
-          key: ${{ env.BIN_NAME }}-${{ needs.check.outputs.binver }}
+          node-version: "22"
+          cache: npm
 
-      - name: 下载二进制（缓存未命中时）
-        if: steps.cache.outputs.cache-hit != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release download "$BIN_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern "$BIN_NAME" \
-            --output "$BIN_NAME" --clobber
+      - name: 安装 Node 依赖（jsdom）
+        run: npm ci
 
-      - name: 运行
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装 Python 依赖
+        run: pip install --quiet requests aiohttp
+
+      - name: 运行（jsdom 引擎）
         # 硬超时兜底：360s 发 SIGTERM，再 20s 未退则 SIGKILL。
-        # 二进制正常约 300s(5 分钟) 后自行优雅退出；万一个别实例被 Akamai 风控挂起，
-        # 也能被强制终止，绝不空耗到 job 超时。运行中结果是分批实时提交的，
-        # 被终止最多只丢最后一小批。
+        # 程序正常约 300s(5 分钟) 后自行优雅退出；个别实例被 Akamai 风控挂起也会被强杀，
+        # 绝不空耗到 job 超时。结果分批实时提交，被终止最多只丢最后一小批。
         run: |
-          chmod +x "$BIN_NAME"
           set +e
-          timeout -k 20 360 "./$BIN_NAME"
+          timeout -k 20 360 python main.py
           ec=$?
           case "$ec" in
             0|124|137|143) echo "运行结束（退出码 $ec，视为正常收尾）"; exit 0 ;;
-            *) echo "::warning::二进制异常退出，退出码 $ec"; exit 0 ;;
+            *) echo "::warning::进程异常退出，退出码 $ec"; exit 0 ;;
           esac
 
   # 接力 + 清理：无论本轮有没有货都再触发下一轮，保持心跳永不熄火
