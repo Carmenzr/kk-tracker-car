@@ -129,7 +129,7 @@ jobs:
     needs: check
     if: ${{ needs.check.outputs.work == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 8
     strategy:
       max-parallel: 19
       fail-fast: false
@@ -139,7 +139,7 @@ jobs:
       WORKERS: "1"
       BATCH_SIZE: "30"
       USE_PROXY: "false"
-      RUN_SECONDS: "60"
+      RUN_SECONDS: "300"
       # 整个会话走这个住宅代理(挑战+查询同一出口)；日志里已脱敏
       PROXY: ${{ secrets.PROXY }}
     steps:
@@ -161,14 +161,14 @@ jobs:
             --output "$BIN_NAME" --clobber
 
       - name: 运行
-        # 硬超时兜底：150s 发 SIGTERM，再 20s 未退则 SIGKILL。
-        # 二进制正常约 60s 后自行优雅退出；万一个别实例被 Akamai 风控挂起，
+        # 硬超时兜底：360s 发 SIGTERM，再 20s 未退则 SIGKILL。
+        # 二进制正常约 300s(5 分钟) 后自行优雅退出；万一个别实例被 Akamai 风控挂起，
         # 也能被强制终止，绝不空耗到 job 超时。运行中结果是分批实时提交的，
         # 被终止最多只丢最后一小批。
         run: |
           chmod +x "$BIN_NAME"
           set +e
-          timeout -k 20 150 "./$BIN_NAME"
+          timeout -k 20 360 "./$BIN_NAME"
           ec=$?
           case "$ec" in
             0|124|137|143) echo "运行结束（退出码 $ec，视为正常收尾）"; exit 0 ;;
