@@ -1,58 +1,42 @@
-name: USPS Mobile Big
+name: USPS Tracker
 
-# 移动端(Akamai) 单号追踪心跳：完整替代旧的 Rust "USPS Tracker" 工作流。
-# 二进制 usps-mobile-big(>100MB, 内含 iv8+V8) 以 Release 资产(tag=mobile-bin)分发，
-# 运行时下载并用 Actions 缓存复用，避免每轮重复拉取。
-#
 # 触发方式：
-#   - workflow_dispatch：手动触发，也是“链式心跳”自触发入口
-#   - schedule：备用唤醒（GitHub 定时不可靠，主要靠 relay 维持心跳）
+#  - workflow_dispatch：手动触发，也是“链式心跳”自触发用的入口
+#  - schedule：仅作备用唤醒（GitHub 定时不可靠，主要靠下面的心跳维持）
 on:
   workflow_dispatch:
   schedule:
     - cron: "*/30 * * * *"
 
-# 并发互斥：同一时刻只允许一个 run，下一轮排队等当前轮结束再开始。
+# 并发互斥：同一时刻只允许一个 workflow run，下一轮排队等当前轮结束再开始，
+# 杜绝两轮重叠导致并发超出账号上限。
 concurrency:
-  group: usps-mobile-big
+  group: usps-tracker
   cancel-in-progress: false
 
-# relay 用内置 GITHUB_TOKEN 触发下一轮 / 删除历史 run，需要 actions: write。
+# 用内置 GITHUB_TOKEN 触发下一轮 / 删除历史 run，需要 actions: write 权限。
+# 这样无需维护会过期的 PAT，避免 relay 报 HTTP 401 Bad credentials。
 permissions:
   actions: write
   contents: read
 
-env:
-  BIN_TAG: mobile-bin
-  BIN_NAME: usps-mobile-big
-
 jobs:
-  # 心跳哨兵：探测库存并生成实例分配 matrix；同时算出二进制版本号用于缓存键。
+  # 心跳哨兵：单个轻量 job，循环探测库存。
+  #   - 有货 / 检测异常（网络抖动）-> 放行，启动干活实例
+  #   - 确认没货（200 且 =0）       -> 原地每 60 秒轮询，只占这 1 个 job，
+  #                                    一旦来货立刻放行；轮询满约 10 分钟则交给下一轮接力继续守。
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
       work: ${{ steps.poll.outputs.work }}
       matrix: ${{ steps.poll.outputs.matrix }}
-      binver: ${{ steps.binver.outputs.binver }}
     steps:
-      - name: 计算二进制版本（缓存键）
-        id: binver
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          ver=$(gh release view "$BIN_TAG" --repo "$GITHUB_REPOSITORY" \
-            --json assets \
-            --jq '.assets[] | select(.name=="'"$BIN_NAME"'") | .updatedAt' 2>/dev/null \
-            | tr -cd '[:alnum:]')
-          [ -z "$ver" ] && ver="none"
-          echo "binver=$ver" >> "$GITHUB_OUTPUT"
-          echo "二进制版本: $ver" 1>&2
-
       - name: 探测库存（心跳轮询）
         id: poll
         run: |
-          # mysql 探测：返回 GO(有货:200且>0) / NO(没货或网络错误)。网络错误一律算没有。
+          # mysql 探测：重试 3 次，返回 GO（有货：200 且 >0）/ NO（没货或网络错误）
+          # 注意：mysql 网络错误一律算“没有”，不分配 mysql 实例。
           check_mysql_once() {
             for i in 1 2 3; do
               code=$(curl -s -4 -o mbody.txt -w "%{http_code}" \
@@ -69,7 +53,7 @@ jobs:
             echo "NO"
           }
 
-          # big 探测：GO(有货) / EMPTY(确认没货) / UNKNOWN(检测失败)
+          # big 单次探测：重试 3 次，返回 GO（有货）/ EMPTY（确认没货）/ UNKNOWN（检测失败）
           check_once() {
             for i in 1 2 3; do
               code=$(curl -s -4 -o body.txt -w "%{http_code}" \
@@ -86,9 +70,9 @@ jobs:
             echo "UNKNOWN"
           }
 
-          # 生成 matrix（19 个实例，开满账号并发）：
-          #   mysql 有货=9 big+10 mysql；mysql 没货=19 big
-          # 单实例有 150s 硬超时兜底，个别被 Akamai 风控挂起也会被强杀，不会拖垮整体。
+          # 生成 matrix（19 个实例分配）：
+          #   - mysql 有货：固定 9 个跑 big + 10 个跑 mysql
+          #   - mysql 没货：19 个全部跑 big
           build_matrix() {
             local mysql_go="$1"
             local items=""
@@ -102,7 +86,7 @@ jobs:
             echo "{\"include\":[$items]}"
           }
 
-          # 最多轮询约 10 分钟（10 次，每次间隔 60s）
+          # 最多轮询约 10 分钟（10 次，每次间隔 60s）。
           for round in $(seq 1 10); do
             m=$(check_mysql_once)
             r=$(check_once)
@@ -112,6 +96,7 @@ jobs:
             if [ "$r" = "GO" ] || [ "$r" = "UNKNOWN" ]; then big_go="yes"; fi
             if [ "$m" = "GO" ]; then mysql_go="yes"; fi
 
+            # 只要 big 或 mysql 任一有活就放行
             if [ "$big_go" = "yes" ] || [ "$mysql_go" = "yes" ]; then
               matrix=$(build_matrix "$mysql_go")
               echo "work=true" >> "$GITHUB_OUTPUT"
@@ -119,79 +104,86 @@ jobs:
               echo "最终分配 matrix: $matrix" 1>&2
               exit 0
             fi
+            # 都没货：原地等 60 秒再探（心跳）
             sleep 60
           done
+          # 轮询期满仍确认没货 -> 本轮不干活（由下一轮接力继续守）
           echo "work=false" >> "$GITHUB_OUTPUT"
           echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
 
-  # 干活：仅当 check 放行（work=true）才启动。
-  # 引擎 = jsdom：直接用源码 + runner 自带的 Node/Python 跑，不再下载 iv8 二进制。
+  # 干活：仅当 check 放行（work=true）才启动这些实例
+  # matrix 由 check 动态生成：mysql 有货=9 big+10 mysql；mysql 没货=19 big
   run:
     needs: check
     if: ${{ needs.check.outputs.work == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     strategy:
+      # 最多 19 个实例 + 1 个 relay = 20，正好占满账号并发上限（check 此时已结束，不占名额）。
       max-parallel: 19
       fail-fast: false
       matrix: ${{ fromJson(needs.check.outputs.matrix) }}
     env:
+      USPS_CLIENT_ID: ${{ secrets.USPS_CLIENT_ID }}
+      USPS_CLIENT_SECRET: ${{ secrets.USPS_CLIENT_SECRET }}
       NUM_TYPE: ${{ matrix.num_type }}
       WORKERS: "1"
-      BATCH_SIZE: "30"
       USE_PROXY: "false"
-      RUN_SECONDS: "300"
-      # 挑战引擎：jsdom（Node 子进程）。改回 iv8 需换回二进制方案，仅改此处无效。
-      CHALLENGE_ENGINE: jsdom
-      # 整个会话走这个住宅代理(挑战+查询同一出口)；日志里已脱敏。jsdom 仅支持 http/https 代理。
-      PROXY: ${{ secrets.PROXY }}
-      # 单号服务器地址已在源码中明文写死默认值，无需 secret 注入。
+      RUN_SECONDS: "60"
+      RUST_LOG: info
     steps:
-      - name: 检出源码
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装 Node（带 npm 缓存）
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-
-      - name: 安装 Node 依赖（jsdom）
-        run: npm ci
-
-      - name: 安装 Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: 安装 Python 依赖
-        run: pip install --quiet requests aiohttp
-
-      - name: 运行（jsdom 引擎）
-        # 硬超时兜底：360s 发 SIGTERM，再 20s 未退则 SIGKILL。
-        # 程序正常约 300s(5 分钟) 后自行优雅退出；个别实例被 Akamai 风控挂起也会被强杀，
-        # 绝不空耗到 job 超时。结果分批实时提交，被终止最多只丢最后一小批。
+      - name: 运行预编译二进制
+        # 二进制为 x86_64-unknown-linux-musl 静态链接，无外部依赖
+        # 固定运行 60 秒（RUN_SECONDS）后优雅退出
         run: |
-          set +e
-          timeout -k 20 360 python main.py
-          ec=$?
-          case "$ec" in
-            0|124|137|143) echo "运行结束（退出码 $ec，视为正常收尾）"; exit 0 ;;
-            *) echo "::warning::进程异常退出，退出码 $ec"; exit 0 ;;
-          esac
+          chmod +x ./bin/usps-tracker-rs
+          ./bin/usps-tracker-rs
+
+  # mysql 常驻备份：不做任何检测、不依赖 check，每轮固定占用一个任务直接跑 mysql。
+  # 无论有没有单号都运行（没单号时空转满 RUN_SECONDS 后优雅退出），保证 mysql 始终有覆盖。
+  run_mysql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      USPS_CLIENT_ID: ${{ secrets.USPS_CLIENT_ID }}
+      USPS_CLIENT_SECRET: ${{ secrets.USPS_CLIENT_SECRET }}
+      NUM_TYPE: mysql
+      WORKERS: "1"
+      USE_PROXY: "false"
+      RUN_SECONDS: "60"
+      RUST_LOG: info
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 运行预编译二进制
+        run: |
+          chmod +x ./bin/usps-tracker-rs
+          ./bin/usps-tracker-rs
 
   # 接力 + 清理：无论本轮有没有货都再触发下一轮，保持心跳永不熄火
+  # if: always()  —— 关键。check 在库存长时间为空/服务器不可达时会撞上
+  # 自身的 timeout-minutes 被强制取消；默认规则下 needs: check 会导致 relay 被跳过，
+  # 于是下一轮永远不会被触发，整条心跳链就此断掉（表现为“不再自动运行”）。
+  # 用 always() 让 relay 无视 check 的成败/超时，始终触发下一轮，保证心跳不熄火。
   relay:
     needs: check
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
       - name: 触发下一轮（保持心跳）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh workflow run "USPS Mobile Big" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}"
+          # 有 concurrency 互斥兜底，立即触发下一轮即可（会排队等本轮结束）。
+          gh workflow run "USPS Tracker" --ref "${{ github.ref_name }}"
 
       - name: 清理已完成的历史 run
         env:
